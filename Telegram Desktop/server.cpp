@@ -1,9 +1,8 @@
 #include <iostream>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <semaphore.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <stdexcept>
 
 int _add(int num1, int num2)
 {
@@ -28,57 +27,36 @@ int _div(int num1, int num2)
         throw std::runtime_error("Division by zero");
 }
 
-int main()
+std::mutex mtx;
+std::condition_variable cv;
+int op_code = -1;
+int num1 = 0;
+int num2 = 0;
+int result = 0;
+bool done = false;
+
+void worker()
 {
-    const char* semName = "/rpc_sem";
-    sem_t* sem = sem_open(semName, O_CREAT, 0666, 0);
-    if (sem == SEM_FAILED)
-    {
-        std::cerr << "sem_open error: " << strerror(errno) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-
-    const char* filename = "/rpc_shm";
-    int fd = shm_open(filename, O_RDWR | O_CREAT, 0666);
-    if (fd == -1)
-    {
-        std::cerr << "shm_open error: " << strerror(errno) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-
-    int shm_size = 4 * sizeof(int);
-    if (ftruncate(fd, shm_size) == -1)
-    {
-        std::cerr << "ftruncate error: " << strerror(errno) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-
-    int* adr = static_cast<int*>(mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    if (adr == MAP_FAILED)
-    {
-        std::cerr << "mmap error: " << strerror(errno) << std::endl;
-        exit(EXIT_FAILURE);
-    }
-    close(fd);
-
     while (true)
     {
-        sem_wait(sem);
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, []{ return done; });
+
         try
         {
-            switch (adr[0])
+            switch (op_code)
             {
                 case 0:
-                    adr[3] = _add(adr[1], adr[2]);
+                    result = _add(num1, num2);
                     break;
                 case 1:
-                    adr[3] = _sub(adr[1], adr[2]);
+                    result = _sub(num1, num2);
                     break;
                 case 2:
-                    adr[3] = _mul(adr[1], adr[2]);
+                    result = _mul(num1, num2);
                     break;
                 case 3:
-                    adr[3] = _div(adr[1], adr[2]);
+                    result = _div(num1, num2);
                     break;
                 default:
                     throw std::invalid_argument("Invalid operation code");
@@ -90,13 +68,44 @@ int main()
             exit(EXIT_FAILURE);
         }
 
-        sem_post(sem);
+        done = false;
+        lock.unlock();
+        cv.notify_one();
     }
+}
 
-    munmap(adr, shm_size);
-    shm_unlink(filename);
-    sem_close(sem);
-    sem_unlink(semName);
+int main()
+{
+    std::thread t(worker);
+    t.detach();
+
+    while (true)
+    {
+        int code = -1;
+        std::cout << "Enter operation code (0=add, 1=sub, 2=mul, 3=div): ";
+        std::cin >> code;
+
+        if (code < 0 || code > 3)
+        {
+            std::cerr << "Invalid operation code" << std::endl;
+            continue;
+        }
+
+        int n1 = 0, n2 = 0;
+        std::cout << "Enter two numbers: ";
+        std::cin >> n1 >> n2;
+
+        std::unique_lock<std::mutex> lock(mtx);
+        op_code = code;
+        num1 = n1;
+        num2 = n2;
+        done = true;
+        cv.notify_one();
+
+        cv.wait(lock, []{ return !done; });
+
+        std::cout << "Result: " << result << std::endl;
+    }
 
     return 0;
 }
